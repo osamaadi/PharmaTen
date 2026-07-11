@@ -1,0 +1,231 @@
+// PharmaTen — Prisma schema
+// Implements the MVP foundation entities from PRD Section 9:
+//   User, Company, Tender, TenderVersion, AuditLogEntry
+// All remaining PRD entities are stubbed as comments at the bottom of this
+// file so the relations can be added without restructuring.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  MANUFACTURER
+  SUPPLIER
+  ADMIN
+}
+
+enum CompanyType {
+  MANUFACTURER
+  SUPPLIER
+}
+
+// PRD Sections 6.1/6.2 step 1 and Section 9: verification is document-based
+// and starts as PENDING until a Platform Admin approves or rejects it.
+enum VerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum TenderStatus {
+  OPEN
+  CLOSED
+  AWARDED
+}
+
+// PRD 6.1 step 3: open to all verified suppliers in category, or invite-only.
+enum TenderVisibility {
+  OPEN
+  INVITE_ONLY
+}
+
+// PRD Section 5: machinery-only category taxonomy for MVP. Modeled as an enum
+// for now; migrates to the Category table (stubbed below) when the admin
+// taxonomy-management flow is built.
+enum EquipmentCategory {
+  TABLET_PRESS
+  CAPSULE_FILLER
+  BLISTER_PACKER
+  GRANULATION_EQUIPMENT
+  OTHER_MACHINERY
+}
+
+// PRD 6.1 step 2: required compliance standard (GMP/EU/FDA/WHO).
+enum ComplianceStandard {
+  GMP
+  EU_GMP
+  FDA
+  WHO
+}
+
+// ---------------------------------------------------------------------------
+// Core models
+// ---------------------------------------------------------------------------
+
+model User {
+  id                 String             @id @default(cuid())
+  name               String
+  email              String             @unique
+  passwordHash       String             @map("password_hash")
+  role               UserRole
+  companyId          String             @map("company_id")
+  company            Company            @relation(fields: [companyId], references: [id])
+  verificationStatus VerificationStatus @default(PENDING) @map("verification_status")
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  tenderVersionsCreated TenderVersion[] @relation("TenderVersionCreatedBy")
+
+  @@map("users")
+}
+
+model Company {
+  id                 String             @id @default(cuid())
+  name               String
+  type               CompanyType
+  country            String
+  verificationStatus VerificationStatus @default(PENDING) @map("verification_status")
+  // Supplier category specializations (PRD 6.2 step 1). Values mirror
+  // EquipmentCategory; stored as text[] so future non-machinery categories
+  // don't force an enum migration.
+  categories         String[]           @default([])
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  users   User[]
+  tenders Tender[]
+
+  @@map("companies")
+}
+
+model Tender {
+  id               String            @id @default(cuid())
+  companyId        String            @map("company_id")
+  company          Company           @relation(fields: [companyId], references: [id])
+  category         EquipmentCategory
+  status           TenderStatus      @default(OPEN)
+  visibility       TenderVisibility  @default(OPEN)
+  // Points at the active version (PRD Section 7: amendments create new
+  // versions; old versions are archived, never deleted).
+  currentVersionId String?           @unique @map("current_version_id")
+  currentVersion   TenderVersion?    @relation("TenderCurrentVersion", fields: [currentVersionId], references: [id])
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+
+  versions TenderVersion[] @relation("TenderVersions")
+
+  @@map("tenders")
+}
+
+model TenderVersion {
+  id            String   @id @default(cuid())
+  tenderId      String   @map("tender_id")
+  tender        Tender   @relation("TenderVersions", fields: [tenderId], references: [id])
+  versionNumber Int      @map("version_number")
+  // Structured spec fields (PRD "TenderSpec"): capacity, compliance standard,
+  // utilities, timeline, budget range. Validated by the TenderSpec zod schema
+  // in src/lib/tender-spec.ts before writes.
+  specJson      Json     @map("spec_json")
+  // Amendment reason (PRD Section 7 step 1); null for version 1.
+  reason        String?
+  createdById   String   @map("created_by")
+  createdBy     User     @relation("TenderVersionCreatedBy", fields: [createdById], references: [id])
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  currentOfTender Tender? @relation("TenderCurrentVersion")
+
+  @@unique([tenderId, versionNumber])
+  @@map("tender_versions")
+}
+
+// Append-only audit trail (PRD Sections 8 and 10, ALCOA+). A Postgres trigger
+// added in the migration blocks UPDATE and DELETE at the database layer —
+// see the audit_log_append_only migration.
+// entityType/action are strings (typed as unions in src/lib/audit.ts) so new
+// auditable entities never require a schema migration.
+model AuditLogEntry {
+  id         String   @id @default(cuid())
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  action     String
+  actorId    String?  @map("actor_id")
+  timestamp  DateTime @default(now())
+  oldValue   Json?    @map("old_value")
+  newValue   Json?    @map("new_value")
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@map("audit_log_entries")
+}
+
+// ---------------------------------------------------------------------------
+// Stubs — remaining PRD Section 9 entities, to be implemented in later
+// sessions. Kept as comments so the intended shape is agreed up front.
+// ---------------------------------------------------------------------------
+
+// model Bid {
+//   id                String   @id @default(cuid())
+//   tenderId          String   // -> Tender
+//   tenderVersionId   String   // -> TenderVersion the bid was submitted against
+//                              //    (PRD 7.5: flag "based on a previous spec version")
+//   supplierCompanyId String   // -> Company
+//   price             Decimal
+//   currency          String
+//   leadTime          String
+//   status            BidStatus // ACTIVE / WITHDRAWN / FLAGGED_OUTDATED
+//   createdAt         DateTime
+//   updatedAt         DateTime
+// }
+
+// model BidDocument {
+//   id           String @id @default(cuid())
+//   bidId        String // -> Bid
+//   docType      String // datasheet, certificate, ...
+//   fileUrl      String // S3-compatible storage (PRD Section 10)
+//   metadataJson Json?
+// }
+
+// model CertificateRecord {
+//   id                 String             @id @default(cuid())
+//   companyId          String             // -> Company
+//   certType           String             // CE, GMP, ISO, ...
+//   issuingBody        String
+//   scope              String?
+//   issueDate          DateTime
+//   expiryDate         DateTime           // auto-flag expired/soon-to-expire (PRD Section 8)
+//   fileUrl            String
+//   verificationStatus VerificationStatus
+// }
+
+// model Message {
+//   id        String   @id @default(cuid())
+//   tenderId  String   // -> Tender
+//   bidId     String?  // nullable: per-bid private Q&A thread (PRD 6.4)
+//   senderId  String   // -> User
+//   body      String
+//   createdAt DateTime
+// }
+
+// model Meeting {
+//   id             String   @id @default(cuid())
+//   tenderId       String   // -> Tender
+//   scheduledAt    DateTime
+//   externalLink   String   // Zoom/Meet link, generation only (PRD 6.4)
+//   summaryText    String?  // mandatory before next tender stage
+//   specChangeFlag Boolean? // true -> triggers Tender Amendment workflow (PRD Section 7)
+// }
+
+// model Category {
+//   id               String  @id @default(cuid())
+//   name             String
+//   parentCategoryId String? // -> Category (taxonomy tree, PRD 6.3)
+// }
